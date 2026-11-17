@@ -27,7 +27,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '2.1.8';
+    const VERSION = '2.1.9';
     const SETTINGS_KEY = 'ro-autoplay.settings.v1';
     const MODE_SETTINGS_KEY = 'ro-autoplay.mode-settings.v1';
     const PANEL_DEFAULTS = { x: null, y: null, width: 620, height: 720, minimized: false };
