@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RO Survivors 自動遠征
 // @namespace    local.ro-survivors.autoplay
-// @version      2.1.8
+// @version      2.1.8 beta 1
 // @author       nyqvori1268
 // @homepageURL  https://github.com/nyqvori1268/R__________O.S
 // @supportURL   https://github.com/nyqvori1268/R__________O.S/issues
