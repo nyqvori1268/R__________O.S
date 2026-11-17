@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         RO Survivors 自動遠征
 // @namespace    local.ro-survivors.autoplay
-// @version      2.1.10
+// @version      2.1.11
 // @author       nyqvori1268
 // @homepageURL  https://github.com/nyqvori1268/R__________O.S
 // @supportURL   https://github.com/nyqvori1268/R__________O.S/issues
 // @updateURL    https://raw.githubusercontent.com/nyqvori1268/R__________O.S/main/ro-survivors-autoplay.user.js
 // @downloadURL  https://raw.githubusercontent.com/nyqvori1268/R__________O.S/main/ro-survivors-autoplay.user.js
-// @description  依當前角色天賦與官方技能池同步可抽技能、顯示解鎖來源、保留排序與排除、F8自動遠征
+// @description  依角色天賦同步技能與排序、F8自動遠征、無盡之塔單次挑戰與生存選卡
 // @match        https://ro-survivors.com/*
 // @run-at       document-idle
 // @grant        none
@@ -23,11 +23,12 @@
  * 技能池、武器／盾牌限制與本局道具另已核對 build adc0fdf6 / main-2n_YvaNQ.js。
  * 使用原遊戲模組的 start / tick callbacks 取得場景，移動沿用 moveTo 尋路。
  * 預設先取得未學技能、補齊本局道具欄位，再依類別、品質與配置順序升級，最後以 DPS 估算決定。
+ * 無盡之塔沿用手動準備的技能與強化，依實際手牌估算生存／清怪效益，結束後停止。
  */
 (function () {
     'use strict';
 
-    const VERSION = '2.1.10';
+    const VERSION = '2.1.11';
     const SETTINGS_KEY = 'ro-autoplay.settings.v1';
     const MODE_SETTINGS_KEY = 'ro-autoplay.mode-settings.v1';
     const PANEL_DEFAULTS = { x: null, y: null, width: 620, height: 720, minimized: false };
@@ -103,6 +104,7 @@
     // Seasonal stages are deliberately omitted from the captain's native list.
     // Keep a stable id so the choice survives list refreshes and language changes.
     const LANTERN_STAGE = { id: 'louyang', name: '燈籠節／洛陽（活動・固定難度）' };
+    const TOWER_STAGE = { id: 'endless', name: '塔之守護者／無盡之塔（單次挑戰）' };
     const CHEST_SLOTS = [
         { id: 'potion', name: '藥水' },
         { id: 'elixir', name: '秘藥' },
@@ -122,6 +124,16 @@
     function isLanternStage(value) {
         return ['louyang', LANTERN_STAGE.name, '燈籠節', '灯笼节', 'lantern festival',
             'festival de los faroles', 'festival das lanternas'].some(name => normalized(value) === normalized(name));
+    }
+
+    function isTowerStage(value) {
+        return ['endless', TOWER_STAGE.name, '塔之守護者', '塔之守护者', '無盡之塔', '无尽之塔',
+            '無限塔', '魔物終結塔', 'endless tower', 'tower guardian'].some(name => normalized(value) === normalized(name));
+    }
+
+    function towerNpcMatches(text, prompt = false) {
+        return (prompt ? /守護者|守护者|guardian|guardi[aá]n|guardi[aã]o/i
+            : /塔之守護者|塔之守护者|tower (?:guardian|keeper)|guardi[aá]n de la torre|guardi[aã]o da torre/i).test(text);
     }
 
     function departureDialogKind(root) {
@@ -161,6 +173,7 @@
         for (const key of ['focusTopCount', 'cardRerollMinQuality', 'cardActionLimit', 'partyRetryLimit']) result[key] = Math.floor(result[key]);
         result.stage = typeof result.stage === 'string' ? result.stage : 'first';
         if (isLanternStage(result.stage)) result.stage = LANTERN_STAGE.id;
+        if (isTowerStage(result.stage)) result.stage = TOWER_STAGE.id;
         result.skillPriority = typeof result.skillPriority === 'string' ? result.skillPriority : '';
         result.skillProfiles = {};
         for (const [job, profile] of Object.entries(input.skillProfiles ?? {})) {
@@ -440,7 +453,7 @@
 
     function canTankDamage(game, settings) {
         const hp = Number(game?.hp), maximum = Number(game?.stats?.maxHp);
-        return Boolean(settings.tankThroughDanger && !game?.player?.dead && Number.isFinite(hp) && Number.isFinite(maximum)
+        return Boolean(!game?.endless && settings.tankThroughDanger && !game?.player?.dead && Number.isFinite(hp) && Number.isFinite(maximum)
             && hp > 0 && maximum > 0 && hp / maximum * 100 >= settings.tankHpPercent);
     }
 
@@ -461,7 +474,7 @@
     }
 
     function openingFarmActive(game, settings) {
-        if (!settings.openingFarm || !Number.isFinite(game?.time) || game.time < 0 || game.time >= settings.openingSeconds
+        if (game?.endless || !settings.openingFarm || !Number.isFinite(game?.time) || game.time < 0 || game.time >= settings.openingSeconds
             || !Number.isFinite(game.level) || typeof game.basicAttack !== 'string'
             || !game.weapons?.some(weapon => weapon.id === game.basicAttack)) return false;
         const attacks = game.weapons.filter(weapon => weapon.id !== game.basicAttack
@@ -586,6 +599,149 @@
         }
         if (rerollsLeft > 0) return { action: 'reroll' };
         return { action: gameTime < 120 ? 'restart' : 'wait' };
+    }
+
+    // Tower offers are upgrades of the manually prepared loadout, not a fresh
+    // skill pool. Evaluate the offered data only: never roll, apply an upgrade
+    // to a live weapon, or change the server-backed tower configuration.
+    function towerCardValue(game, card, helpers) {
+        const result = { defense: 0, healing: 0, control: 0, damage: 0, mobility: 0, coverage: 0 };
+        const stats = game.stats || {}, hp = Math.max(1, Number(stats.maxHp) || 1);
+        const number = value => Number.isFinite(value) ? value : 0;
+        const weapon = game.weapons?.find(entry => entry.id === card.id);
+        if (!weapon) {
+            const definition = helpers.skills?.[card.id];
+            if (typeof definition?.passive !== 'function' || typeof helpers.createStats !== 'function') return result;
+            const raw = helpers.createStats(game.classDef);
+            const before = { ...raw, ext: { ...raw.ext } };
+            definition.passive(raw, Number.isFinite(card.power) ? card.power : 1);
+            const delta = key => number(raw[key]) - number(before[key]);
+            const reduction = clamp(number(stats.damageReduction), 0, 0.6), flee = clamp(number(stats.flee), 0, 0.5);
+            result.defense += (1 - reduction) / Math.max(0.4, 1 - clamp(reduction + delta('damageReduction'), 0, 0.6)) - 1;
+            result.defense += (1 - flee) / Math.max(0.5, 1 - clamp(flee + delta('flee'), 0, 0.5)) - 1;
+            result.defense += delta('maxHp') * (1 + number(helpers.levelHp) * Math.max(0, number(game.level) - 1)) / hp;
+            result.defense += delta('armor') / Math.max(40, number(stats.armor) + 40) + delta('def') / Math.max(100, number(stats.def) + 100);
+            result.defense += Math.floor(number(stats.revives) + delta('revives')) - Math.floor(number(stats.revives));
+            result.healing += (delta('regen') + delta('regenMoving') + delta('regenStill') * 0.25
+                + delta('regen5') / 5 + delta('regenPct5') * hp / 5) * 8 / hp;
+            result.healing += delta('lifesteal') * 0.6;
+            result.control += delta('petrifyChance') + delta('stunChance');
+            result.damage += delta('damageMult') / Math.max(0.1, number(stats.damageMult))
+                + delta('haste') / Math.max(1, 1 + number(stats.haste))
+                + delta('critChance') * Math.max(0, number(stats.critMult) - 1)
+                + delta('doubleChance') / Math.max(1, 1 + number(stats.doubleChance));
+            result.damage += delta('lowHpDamage') * (game.hp / hp < 0.4 ? 0.5 : 0.05);
+            result.coverage += delta('extraProjectiles') / Math.max(1, 1 + number(stats.extraProjectiles)) * 0.4
+                + delta('areaMult') / Math.max(1, number(stats.areaMult))
+                + delta('reachMult') / Math.max(1, number(stats.reachMult)) * 0.4;
+            result.mobility += delta('speedMult') / Math.max(1, number(stats.speedMult));
+            // EXP, gold, drops and chest discounts provide no tower combat benefit.
+            return result;
+        }
+        if (!card.upgrade) return result;
+        const copies = new Map(game.weapons.map(value => [value, Object.assign(Object.create(Object.getPrototypeOf(value)), value,
+            { up: { ...value.up }, effUp: { ...value.effUp }, history: [...(value.history || [])] })]));
+        for (const [old, copy] of copies) if (old.effPeers) copy.effPeers = old.effPeers.map(peer => copies.get(peer) || peer);
+        const upgraded = copies.get(weapon), view = Object.create(game);
+        view.weapons = [...copies.values()];
+        for (const part of card.upgrade.parts || [card.upgrade]) {
+            if (!(Number.isFinite(part.amount) && part.amount > 0)) continue;
+            if (part.aspect === 'effect' && typeof part.effect === 'string') {
+                upgraded.effUp[part.effect] = number(upgraded.effUp[part.effect]) + part.amount;
+            } else if (Object.hasOwn(upgraded.up, part.aspect)) upgraded.up[part.aspect] += part.amount;
+        }
+        const shape = (value, context) => {
+            const mod = typeof value.mod === 'function' ? value.mod(context) : value.up;
+            const cycle = Math.max(0.15, number(value.finalCooldown?.(context)) + number(value.finalCastTime?.(context)) || 1);
+            return { cycle, damage: Math.max(0.01, 1 + number(mod.dmg)),
+                count: Math.max(1, 1 + number(mod.count)), targets: Math.max(1, 1 + number(mod.targets) * 0.35),
+                area: Math.max(0.1, 1 + number(mod.area)), reach: Math.max(0.1, 1 + number(mod.reach)),
+                duration: Math.max(0.1, 1 + number(mod.duration)), pierce: Math.max(1, 1 + number(mod.pierce) * 0.25) };
+        };
+        const a = shape(weapon, game), b = shape(upgraded, view), rate = a.cycle / b.cycle;
+        const healing = new Set(['heal', 'hp_recovery', 'aqua_benedicta', 'potion_pitcher', 'sanctuary', 'kaahi']);
+        const protection = new Set(['endure', 'auto_guard', 'safety_wall', 'siegfried', 'chemical_protection', 'cloaking', 'kaizel', 'kaupe']);
+        const duration = Math.min(1, 5 * a.duration / a.cycle), nextDuration = Math.min(1, 5 * b.duration / b.cycle);
+        const gain = b.damage / a.damage * rate * b.count / a.count * b.targets / a.targets * b.pierce / a.pierce - 1;
+        if (weapon.type !== 'buff' && !['frost_diver', 'aqua_benedicta'].includes(weapon.id)) {
+            const logs = (game.weapons || []).filter(value => value.type !== 'buff').map(value =>
+                [...(game.dmgLog?.get(value.id)?.values() || [])].reduce((sum, damage) => sum + damage, 0));
+            const total = logs.reduce((sum, damage) => sum + damage, 0);
+            const own = [...(game.dmgLog?.get(weapon.id)?.values() || [])].reduce((sum, damage) => sum + damage, 0);
+            const share = total > 0 ? Math.max(0.08, own / total) : 1 / Math.max(1, logs.length);
+            result.damage += gain * share;
+        }
+        result.coverage += (b.area / a.area - 1) * 0.4 + (b.reach / a.reach - 1) * 0.15;
+        for (const effect of weapon.effects || []) {
+            if (typeof weapon.eff !== 'function') continue;
+            const old = weapon.eff(effect.key), next = upgraded.eff(effect.key);
+            const delta = next - old, change = next / b.cycle - old / a.cycle;
+            if (effect.key === 'heal') {
+                const scale = weapon.id === 'heal' ? 1 + number(stats.matk) / 150 : weapon.id === 'hp_recovery' ? 0.1 : 1;
+                result.healing += change * scale * 8 / hp;
+            } else if (['reduction', 'weaken', 'block', 'flee'].includes(effect.key)) {
+                const current = clamp(old * duration, 0, 0.8), future = clamp(next * nextDuration, 0, 0.8);
+                result.defense += (1 - current) / Math.max(0.2, 1 - future) - 1;
+            } else if (['freeze', 'stun', 'slow', 'blind', 'sleep'].includes(effect.key)) {
+                const boss = game.endless?.wave?.mvp || game.endless?.wave?.bosses?.length > 0;
+                result.control += change * (effect.fmt === 'pct' ? 4 : 1) * (boss ? 0.25 : 1)
+                    * Math.min(2, b.count / a.count * b.area / a.area);
+            } else if (effect.key === 'speed') result.mobility += next * nextDuration - old * duration;
+            else if (['dmg', 'mark', 'holy', 'poison', 'agiDex', 'haste', 'cast', 'fervor', 'time'].includes(effect.key)) {
+                const scale = effect.key === 'haste' ? 0.01 : effect.key === 'fervor' ? 0.15 : 1;
+                result.damage += delta * scale * 0.5 + (rate - 1) * Math.min(0.5, old * scale);
+            }
+        }
+        if (healing.has(weapon.id) && !weapon.effects?.some(effect => effect.key === 'heal')) {
+            result.healing += Math.max(0, rate * b.duration / a.duration - 1) * 0.2;
+        }
+        if (protection.has(weapon.id) && !weapon.effects?.some(effect => ['reduction', 'block', 'flee'].includes(effect.key))) {
+            result.defense += Math.max(0, nextDuration - duration) * 0.4;
+        }
+        if (healing.has(weapon.id)) result.healing += Math.max(0, b.duration / a.duration - 1) * 0.1;
+        if (weapon.type === 'buff' && !healing.has(weapon.id) && !protection.has(weapon.id) && !weapon.effects?.length) {
+            result.damage += Math.max(0, rate * b.duration / a.duration - 1) * 0.1;
+        }
+        return result;
+    }
+
+    function towerCardDecision(game, cards, helpers, profile, context = {}, deity = false) {
+        const hp = clamp(game.hp / Math.max(1, game.stats?.maxHp || 1), 0, 1);
+        const low = Math.min(hp, Number.isFinite(context.minHp) ? context.minHp : hp);
+        const survival = low < 0.4 ? 3.2 : low < 0.7 ? 2 : 1.2;
+        const offense = 1.5 + clamp(context.offenseNeed || 0, 0, 1) * 3;
+        const labels = { defense: '血量／減傷', healing: '回血續航', control: '控場減壓', damage: '限時清怪／頭目傷害', mobility: '移動避險', coverage: '攻擊覆蓋' };
+        const choices = cards.flatMap((card, index) => {
+            if (typeof card?.id !== 'string') return [];
+            const id = deity ? card.id : skillProfileId(card, game.basicAttack);
+            const excluded = Boolean(profile?.excluded?.includes(id));
+            let parts;
+            try {
+                parts = deity ? { defense: 0, healing: 0, control: 0, damage: 0, mobility: 0, coverage: 0 }
+                    : towerCardValue(game, card, helpers);
+                if (deity) {
+                    const weapon = game.weapons?.find(value => value.id === card.id);
+                    if (!weapon) return [];
+                    const keys = weapon.effects?.map(effect => effect.key) || [];
+                    parts.healing = keys.includes('heal') || ['sanctuary', 'potion_pitcher', 'kaahi'].includes(card.id) ? 0.3 : 0;
+                    parts.defense = keys.some(key => ['reduction', 'block', 'flee'].includes(key))
+                        || ['safety_wall', 'siegfried', 'chemical_protection', 'kaizel', 'kaupe'].includes(card.id) ? 0.25 : 0;
+                    parts.control = keys.some(key => ['freeze', 'stun', 'slow', 'blind', 'sleep'].includes(key)) ? 0.15 : 0;
+                    parts.damage = weapon.type === 'buff' || card.id === 'frost_diver' ? 0.08 : 0.25;
+                }
+            } catch { parts = { damage: 0 }; }
+            const weighted = { defense: (parts.defense || 0) * survival * 1.4, healing: (parts.healing || 0) * survival * 1.7 * (0.25 + (1 - low) * 1.25),
+                control: (parts.control || 0) * survival * 0.7, mobility: (parts.mobility || 0) * survival * 0.5,
+                damage: (parts.damage || 0) * offense, coverage: (parts.coverage || 0) * offense * 0.35 };
+            const score = Object.values(weighted).reduce((sum, value) => sum + (Number.isFinite(value) ? value : 0), 0);
+            const reason = Object.keys(weighted).sort((a, b) => weighted[b] - weighted[a]).find(key => weighted[key] > 1e-8);
+            const rank = profile?.order?.indexOf(id) ?? -1;
+            return [{ index, score, excluded, rank: rank < 0 ? 1e9 : rank, quality: cardQuality(card),
+                reason: labels[reason] || '本次強化效益有限，依配置與品質選擇', parts }];
+        });
+        const allowed = choices.filter(choice => !choice.excluded), pool = allowed.length ? allowed : choices;
+        pool.sort((a, b) => b.score - a.score || a.rank - b.rank || b.quality - a.quality || a.index - b.index);
+        return pool[0] ? { action: 'pick', ...pool[0], fallback: !allowed.length } : { action: 'wait' };
     }
 
     function pendingNativeOffer(game) {
@@ -802,6 +958,7 @@
         const available = rows.filter(row => row.unlocked);
         if (!available.length) return null;
         if (isLanternStage(preference)) return available.find(row => row.id === LANTERN_STAGE.id || isLanternStage(row.name)) ?? null;
+        if (isTowerStage(preference)) return available.find(row => row.id === TOWER_STAGE.id || isTowerStage(row.name)) ?? null;
         if (preference === 'last') return available[available.length - 1];
         if (preference === 'first') return available[0];
         return available.find(row => row.name === preference) ?? available[0];
@@ -1303,7 +1460,7 @@
     }
 
     function resourceFarmPlan(game, settings, pickups, context, currentGoal = null) {
-        if (!settings.resourceFarm || !(settings.resourceLootRadius > 0) || !context || !(context.speed > 0)) return null;
+        if (game?.endless || !settings.resourceFarm || !(settings.resourceLootRadius > 0) || !context || !(context.speed > 0)) return null;
         const radius = settings.resourceLootRadius;
         // Opening melee prediction is deliberately shorter. Resource trips use
         // full enemy forecasts so a distant coin cannot lure us through a mob.
@@ -1445,6 +1602,9 @@
             this.bellMode = null;
             this.offer = null;
             this.offerSerial = 0;
+            this.towerOffer = null;
+            this.towerObserved = null;
+            this.towerContext = {};
             this.cardControlSession = null;
             this.skillContext = null;
             this.skillContextSignature = '';
@@ -1682,6 +1842,9 @@
             if (this.game === game) return;
             if (!point(game?.player) || !Array.isArray(game.enemies) || !Array.isArray(game.pickups) || typeof game.moveTo !== 'function') return;
             this.game = game;
+            this.towerOffer = null;
+            this.towerObserved = null;
+            this.towerContext = {};
             this.runMode = this.activeMode;
             this.partyFlow.phase = 'idle';
             this.partyFlow.attempts = 0;
@@ -2224,10 +2387,25 @@
             if (!this.enabled || !this.ready) return;
             if (document.hidden) { this.cancelMovement(); this.status = '分頁隱藏，等待返回'; return; }
             if (this.visible('#loading') || this.visible('#pause')) { this.cancelMovement(); this.status = '等待遊戲載入或手動繼續'; return; }
+            const inTower = Boolean(this.game?.endless && !this.visible('#lobby-ui'));
+            if (inTower && (this.game.replayMoves || this.game.endless.scripted || this.game.endless.autoPicks)) {
+                this.stop('目前是無盡之塔回放，自動操作已停止'); return;
+            }
             if (this.handleServerConnectionNotice()) return;
             if (this.visible('#gameover')) { this.handleGameOver(now); return; }
             if (this.visible('#drop-reveal')) { this.cancelMovement(); this.handleDrop(); return; }
+            if (inTower && this.game.endless.state === 'pick') {
+                this.cancelMovement();
+                if (this.visible('#picker')) this.handleTowerPicker(now);
+                else this.status = '無盡之塔：等待原生神祇／強化卡畫面';
+                return;
+            }
             if (this.visible('#picker')) { this.cancelMovement(); this.handlePicker(now); return; }
+            if (isTowerStage(this.settings.stage) && this.visible('#lobby-ui')
+                && (this.activeMode === 'party' || this.partyState?.inParty)) {
+                this.stop('無盡之塔為單人挑戰，請手動離隊並確認技能／強化後再按 F8'); return;
+            }
+            if (this.visible('#towerkeeper')) { this.cancelMovement(); this.handleTowerKeeper(); return; }
             if (this.handlePartyLobby(now)) { this.cancelMovement(); return; }
             if (this.visible('#festival')) { this.cancelMovement(); this.handleFestival(); return; }
             if (this.visible('#stages')) { this.cancelMovement(); this.handleStages(); return; }
@@ -2235,6 +2413,12 @@
             if (this.visible('#lobby-ui')) { this.handleTown(now); return; }
             const game = this.game;
             if (!game) { this.status = '等待戰鬥狀態'; return; }
+            if (inTower && game.endless.state !== 'fight') {
+                this.cancelMovement();
+                this.status = game.endless.state === 'done' ? '無盡之塔：本次挑戰結束，等待伺服器結算'
+                    : `無盡之塔：等待第 ${game.endless.wave?.n || 1} 層開始`;
+                return;
+            }
             if (game.state === 'cutscene') {
                 this.cancelMovement();
                 this.status = '劇情對話';
@@ -2247,12 +2431,14 @@
             if (game.state !== 'playing' || game.player.dead) { this.status = `等待遊戲 (${game.state})`; return; }
             if (now - this.lastMotion < this.settings.decisionMs) return;
             this.lastMotion = now;
+            if (inTower) this.observeTowerCombat();
             this.handleCombat(now);
         }
 
         handleOfflineLobby() {
             const state = readPartyState(this.game, typeof document === 'undefined' ? null : document);
-            if (this.activeMode === 'party' || state.inParty || !this.enabled || !this.ready || !this.settings.offlineLobby || document.hidden || !this.visible('#npc-dialog')) return false;
+            if (isTowerStage(this.settings.stage) || this.game?.endless && !this.visible('#lobby-ui')
+                || this.activeMode === 'party' || state.inParty || !this.enabled || !this.ready || !this.settings.offlineLobby || document.hidden || !this.visible('#npc-dialog')) return false;
             // This is the game's lobby picker, not a generic NPC/confirmation dialog.
             if (!document.querySelector('#npc-text .lb-pick')) return false;
             const labels = new Set(['單人大廳', '单人大廳', '单人大厅', 'solo lobby', 'lobby solo', '離線遊玩', '离线游玩', 'jugar sin conexión', 'play offline', 'jogar offline', 'jogar sem conexão']);
@@ -2387,7 +2573,7 @@
             const select = this.ui.querySelector('#ra-stage');
             select.replaceChildren();
             for (const [value, label] of [['first', '第一個可挑戰副本'], ['last', '最後一個可挑戰副本'],
-                [LANTERN_STAGE.id, LANTERN_STAGE.name]]) select.add(new Option(label, value));
+                [LANTERN_STAGE.id, LANTERN_STAGE.name], [TOWER_STAGE.id, TOWER_STAGE.name]]) select.add(new Option(label, value));
             for (const row of rows) {
                 const option = new Option(`${row.name} · ${row.state}`, row.name);
                 option.disabled = !row.unlocked;
@@ -2399,6 +2585,11 @@
 
         handleStages() {
             if (!this.partyLeaderCanAct()) return;
+            if (isTowerStage(this.settings.stage)) {
+                this.status = '無盡之塔需由塔之守護者進場，關閉一般選關';
+                this.click(document.getElementById('stg-close'));
+                return;
+            }
             if (isLanternStage(this.settings.stage)) {
                 this.status = '燈籠節需由節慶主持人進場，關閉一般選關';
                 this.click(document.getElementById('stg-close'));
@@ -2428,6 +2619,11 @@
             if (!this.partyLeaderCanAct()) return;
             const kind = departureDialogKind(document);
             if (!kind) { this.status = '目前對話需手動處理，完成後自動接續'; return; }
+            if (isTowerStage(this.settings.stage)) {
+                this.status = '無盡之塔不使用一般出征確認，返回塔之守護者';
+                this.click(Array.from(document.querySelectorAll('#npc-options button')).find(button => !button.classList.contains('primary')));
+                return;
+            }
             const festival = isLanternStage(this.settings.stage);
             if ((kind === 'fixed') !== festival) {
                 this.status = '出征視窗與所選副本不同，關閉後重新前往入口';
@@ -2471,14 +2667,17 @@
         handleTown(now) {
             if (!this.partyLeaderCanAct()) return;
             const festival = isLanternStage(this.settings.stage);
-            const target = festival ? '節慶主持人' : '遠征隊長';
+            const tower = isTowerStage(this.settings.stage);
+            const target = tower ? '塔之守護者' : festival ? '節慶主持人' : '遠征隊長';
+            const matches = (text, prompt = false) => tower ? towerNpcMatches(text, prompt) : townNpcMatches(text, festival, prompt);
             this.status = `前往${target}`;
             const prompt = document.getElementById('lobby-prompt');
-            if (this.visible(prompt) && townNpcMatches(prompt.textContent, festival, true)) { this.click(prompt); return; }
+            if (this.visible(prompt) && matches(prompt.textContent, true)) { this.click(prompt); return; }
             if (now - this.lastAction < 1600) return;
-            const label = Array.from(document.querySelectorAll('#lobby-labels .npc')).find(element => townNpcMatches(element.textContent, festival));
+            const label = Array.from(document.querySelectorAll('#lobby-labels .npc')).find(element => matches(element.textContent));
             const canvas = document.querySelector('#stage canvas:last-child');
-            if (!label || !canvas) { this.status = festival ? '等待節慶主持人標籤，請確認活動仍開放' : '等待遠征隊長標籤'; return; }
+            if (!label || !canvas) { this.status = tower ? '等待塔之守護者標籤，請確認角色已解鎖無盡之塔'
+                : festival ? '等待節慶主持人標籤，請確認活動仍開放' : '等待遠征隊長標籤'; return; }
             const rect = label.getBoundingClientRect();
             const area = canvas.getBoundingClientRect();
             const x = clamp(rect.left + rect.width / 2, area.left + 25, area.right - 25);
@@ -2490,6 +2689,70 @@
             this.lastAction = now;
         }
 
+        handleTowerKeeper() {
+            if (!isTowerStage(this.settings.stage)) { this.status = '正在設定塔用技能／強化；完成後手動關閉此視窗'; return; }
+            if (this.activeMode === 'party' || this.partyState?.inParty) { this.stop('無盡之塔為單人挑戰，請先手動離隊'); return; }
+            if (this.visible('#npc-dialog')) { this.status = '無盡之塔：請先手動完成原生對話與技能設定'; return; }
+            const selected = document.querySelector('#tk-nav .sel');
+            if (selected?.dataset.tab !== 'tower') {
+                this.status = '請自行完成塔用技能與強化點數，完成後切回守護者的「無盡之塔」頁';
+                return;
+            }
+            if (document.getElementById('tk-continue')) {
+                this.status = '有已儲存的塔挑戰，請手動選擇繼續或新挑戰；入場後工具自動接手';
+                return;
+            }
+            const enter = document.getElementById('tk-new');
+            if (!enter || enter.disabled) { this.status = '等待塔之守護者確認資格與伺服器資料；不會改進一般副本'; return; }
+            this.status = '無盡之塔：以你已設定的技能／強化進行單次挑戰';
+            if (this.click(enter)) this.log('開始單次塔挑戰；技能與強化點數沿用手動設定，本次結束後停止');
+        }
+
+        observeTowerCombat() {
+            const game = this.game, tower = game?.endless;
+            if (!tower || tower.state !== 'fight') return;
+            if (this.towerObserved?.wave !== tower.wave.n) {
+                if (this.towerObserved) this.towerContext = { ...this.towerObserved };
+                this.towerObserved = { wave: tower.wave.n, minHp: 1, offenseNeed: 0 };
+            }
+            this.towerObserved.minHp = Math.min(this.towerObserved.minHp, game.hp / Math.max(1, game.stats.maxHp));
+            const seconds = Math.max(1, tower.wave.seconds || 60), elapsed = Math.max(0, seconds - tower.left);
+            if (elapsed > seconds * 0.4) {
+                const pace = tower.quota > 0 ? tower.waveScore / tower.quota / Math.max(0.01, elapsed / seconds) : 1;
+                const bosses = tower.bossList?.some(enemy => !enemy.dead);
+                this.towerObserved.offenseNeed = Math.max(clamp((1 - pace) * 2, 0, 1), bosses && tower.left < seconds * 0.35 ? 0.7 : 0);
+            }
+        }
+
+        handleTowerPicker(now) {
+            const game = this.game, tower = game?.endless, offer = tower?.offer;
+            if (!tower || tower.state !== 'pick' || !offer || !['card', 'deity'].includes(offer.kind)) {
+                this.status = '無盡之塔：此選擇需手動處理'; return;
+            }
+            if (document.getElementById('picker')?.classList.contains('closing')) return;
+            const data = offer.kind === 'deity' ? offer.skills?.map(id => ({ id })) : offer.cards;
+            const cards = Array.from(document.querySelectorAll('#pk-cards .pk-card'));
+            if (!data?.length || data.length !== cards.length) { this.status = '無盡之塔：等待完整原生卡片'; return; }
+            if (offer.kind === 'card' && game.hand?.level !== offer.cards) {
+                this.status = '無盡之塔：等待本層原生手牌更新'; return;
+            }
+            if (this.towerOffer !== offer) { this.towerOffer = offer; this.pickerSince = now; }
+            if (now - this.pickerSince < this.settings.choiceDelay * 1000) return;
+            const deity = offer.kind === 'deity';
+            const profile = deity ? this.chestContext && this.settings.chestProfiles[this.chestContext.key]?.deity
+                : this.skillContext && this.settings.skillProfiles[this.skillContext.key];
+            const context = this.towerObserved || this.towerContext;
+            const decision = towerCardDecision(game, data, this.bindings, profile, context, deity);
+            if (decision.action !== 'pick') { this.status = '無盡之塔：無法辨識本次選項，請手動選擇'; return; }
+            const index = decision.index, name = cards[index].querySelector('.pk-name')?.textContent || data[index].id;
+            this.status = `無盡之塔：${decision.reason} → ${name}`;
+            const slot = cards[index].closest('.pk-slot');
+            const button = slot?.classList.contains('asking') ? slot.querySelector('[data-yes]') : cards[index];
+            if (this.click(button, 800) && tower.offer !== offer) {
+                this.log(`塔第 ${tower.wave?.n || 1} 層${deity ? '神祇' : '強化卡'}：${name}；${decision.reason}${decision.fallback ? '（全數已排除，使用生存備援）' : ''}`);
+            }
+        }
+
         handleDrop() {
             this.status = '取得掉落';
             const take = document.querySelector('#drop-reveal .dr-get') ?? document.querySelector('#drop-reveal [data-c="need"]');
@@ -2497,6 +2760,7 @@
         }
 
         handlePicker(now) {
+            if (this.game?.endless) { this.handleTowerPicker(now); return; }
             const picker = document.getElementById('picker');
             if (picker.classList.contains('closing')) { this.offer = null; this.cardControlSession = null; return; }
             this.syncNativeOffer();
@@ -2648,6 +2912,7 @@
         }
 
         restartForSkillBuild() {
+            if (this.game?.endless) { this.status = '無盡之塔為單次挑戰，不因技能配置重開'; return; }
             if (this.isPartyRun()) { this.status = '組隊中停用個人開場重開，依備援選牌設定處理'; return; }
             const game = this.game;
             if (this.retryGame === game) return;
@@ -2763,6 +3028,17 @@
 
         handleGameOver(now) {
             this.cancelMovement();
+            if (this.game?.endless) {
+                const restart = document.getElementById('btn-restart');
+                if (!restart || restart.disabled) { this.status = '無盡之塔：等待伺服器結算，本次不會重複'; return; }
+                const game = this.game;
+                if (!this.finishedGames.has(game)) {
+                    this.finishedGames.add(game); this.runCount++;
+                    this.log(`單次塔挑戰結束，第 ${game.endless.wave?.n || 1} 層；不會重複進場`);
+                }
+                this.stop('無盡之塔：本次挑戰已結束，自動操作停止；可手動查看結算或返回廣場');
+                return;
+            }
             // Finish server settlement even on the last allowed run or when
             // repeat is off. Never leave an unfinished Need/Greed vote early.
             if (this.handleServerSettlement()) return;
@@ -2975,7 +3251,6 @@
 
         handleCombat(now) {
             const game = this.game;
-            if (game.endless) { this.stop('目前為無盡之塔，請返回一般遠征使用'); return; }
             const speed = game.classDef.speed * this.bindings.speedUnits * game.stats.speedMult * (1 + game.buffValue('speed')) * (1 - game.buffValue('slow'));
             if (!Number.isFinite(speed) || speed <= 0 || !game.bounds) throw new Error('無法讀取移動狀態');
             const recentRecovery = this.recoveryRushSource || (this.pendingRecovery?.until > game.time ? this.pendingRecovery.key : null);
@@ -3282,7 +3557,7 @@
                         <div class="hint connection" id="ra-connection"></div>
                         <div class="status" id="ra-status"></div><div class="stat" id="ra-stat"></div>
                         <div class="row hp-row"><label for="ra-hp">承傷拾取最低 HP</label><input id="ra-hp" type="number" data-setting="tankHpPercent" min="0" max="100" step="1"><span>%</span></div>
-                        <div class="hint">HP 達門檻且有沿途補血或可用回血技能時，可承傷湊錢／開箱。自動避開死路；裝備與卡片留待結算。</div>
+                        <div class="hint" id="ra-hp-hint">HP 達門檻且有沿途補血或可用回血技能時，可承傷湊錢／開箱。自動避開死路；裝備與卡片留待結算。</div>
                         <div class="workspace">
                             <div class="tabs" role="tablist" aria-label="自動遠征設定">
                                 <button type="button" id="ra-tab-stage" role="tab" data-tab="stage" aria-controls="ra-page-stage" aria-selected="true">出征&amp;難度</button>
@@ -3293,9 +3568,9 @@
                             </div>
                             <section class="tab-panel" id="ra-page-stage" role="tabpanel" aria-labelledby="ra-tab-stage" tabindex="0">
                                 <h2>出征&amp;難度</h2>
-                                <div class="row"><label for="ra-stage">副本</label><select id="ra-stage"><option value="first">第一個可挑戰副本</option><option value="last">最後一個可挑戰副本</option><option value="${LANTERN_STAGE.id}">${LANTERN_STAGE.name}</option></select></div>
-                                <div class="row"><label><input type="checkbox" data-setting="repeat"> 重複出征</label><label for="ra-runs">場數</label><input id="ra-runs" type="number" data-setting="maxRuns" min="0" max="9999"></div>
-                                <div class="hint">場數 0 持續出征。F8 開啟時重新計數；一般副本與隊長交談後載入，燈籠節由節慶主持人進場。</div>
+                                <div class="row"><label for="ra-stage">副本</label><select id="ra-stage"><option value="first">第一個可挑戰副本</option><option value="last">最後一個可挑戰副本</option><option value="${LANTERN_STAGE.id}">${LANTERN_STAGE.name}</option><option value="${TOWER_STAGE.id}">${TOWER_STAGE.name}</option></select></div>
+                                <div class="row" id="ra-repeat-controls"><label><input type="checkbox" data-setting="repeat"> 重複出征</label><label for="ra-runs">場數</label><input id="ra-runs" type="number" data-setting="maxRuns" min="0" max="9999"></div>
+                                <div class="hint" id="ra-repeat-hint">場數 0 持續出征。F8 開啟時重新計數；一般副本與隊長交談後載入，燈籠節由節慶主持人進場。</div>
                                 <div class="hint" id="ra-party-state"></div>
                                 <div id="ra-difficulty-controls">
                                 ${DIFFICULTY.map(item => `<div class="row difficulty-row"><label for="ra-diff-${item.key}">${item.name}<small data-difficulty-range="${item.key}">100–${Math.round(item.max * 100)}%</small></label><input type="range" id="ra-diff-${item.key}" data-difficulty="${item.key}" min="1" max="${item.max}" step="0.05"><output for="ra-diff-${item.key}" data-difficulty-out="${item.key}">100%</output></div>`).join('')}
@@ -3407,11 +3682,21 @@
         renderStageControls() {
             if (!this.ui) return;
             const festival = isLanternStage(this.settings.stage);
+            const tower = isTowerStage(this.settings.stage) || Boolean(this.game?.endless && !this.visible('#lobby-ui'));
             const controls = this.ui.querySelector('#ra-difficulty-controls');
-            if (controls) controls.hidden = festival;
-            for (const input of this.ui.querySelectorAll('[data-difficulty]')) input.disabled = festival;
+            if (controls) controls.hidden = festival || tower;
+            for (const input of this.ui.querySelectorAll('[data-difficulty]')) input.disabled = festival || tower;
+            this.ui.querySelector('#ra-repeat-controls').hidden = tower;
+            this.ui.querySelector('#ra-repeat-hint').hidden = tower;
+            for (const input of this.ui.querySelectorAll('#ra-repeat-controls input')) input.disabled = tower;
+            this.ui.querySelector('#ra-hp').disabled = tower;
+            this.ui.querySelector('#ra-hp-hint').textContent = tower
+                ? '塔內以避險生存為優先，不使用承傷拾取門檻；一般副本的 HP 設定已保留。'
+                : 'HP 達門檻且有沿途補血或可用回血技能時，可承傷湊錢／開箱。自動避開死路；裝備與卡片留待結算。';
             const hint = this.ui.querySelector('#ra-stage-hint');
-            if (hint) hint.textContent = festival
+            if (hint) hint.textContent = tower
+                ? '單次挑戰，不重複、不重開。請入場前在塔之守護者自行選好技能與分配強化點數；工具不代為更改。塔內依血量、續航、控場及清怪／頭目時限估算選卡，設定順位為同分參考；全數❌時仍會備援選卡。此策略無法保證通關。'
+                : festival
                 ? '燈籠節為固定難度，採即時升級；一般副本的難度設定已保留。組隊由隊長提議，隊員自動準備。'
                 : '難度下一場套用；組隊由隊長提議，隊員自動準備，全員回城後接續。';
         }
@@ -3425,6 +3710,7 @@
 
         renderStatus() {
             if (!this.ui) return;
+            this.renderStageControls();
             this.ui.querySelector('#ra-status').textContent = this.status;
             this.renderModeControls();
             const connecting = this.connectionState === 'connecting';
@@ -3437,7 +3723,10 @@
             shortcut.textContent = this.enabled ? 'F8 關閉自動' : connecting ? '連接中…' : 'F8 開啟自動';
             shortcut.classList.toggle('running', this.enabled);
             const game = this.game;
-            this.ui.querySelector('#ra-stat').textContent = game && !this.visible('#lobby-ui')
+            const tower = game?.endless && !this.visible('#lobby-ui') ? game.endless : null;
+            this.ui.querySelector('#ra-stat').textContent = tower
+                ? `單次塔挑戰 · 第 ${tower.wave?.n || 1} 層 · HP ${Math.ceil(game.hp)} / ${Math.ceil(game.stats?.maxHp || 0)} · 本層分數 ${Math.round(tower.waveScore || 0)} / ${Math.round(tower.quota || 0)}`
+                : game && !this.visible('#lobby-ui')
                 ? `已完成 ${this.runCount} 場 · 技能重試 ${this.retryCount} 次 · Lv ${game.level} · HP ${Math.ceil(game.hp)} / ${Math.ceil(game.stats?.maxHp || 0)}（${Math.round(game.hp / Math.max(1, game.stats?.maxHp || 0) * 100)}%） · ${game.zeny} z`
                 : `已完成 ${this.runCount} 場 · 技能重試 ${this.retryCount} 次`;
         }
@@ -3445,8 +3734,8 @@
 
     // The exports allow the decision and controller logic to be tested without starting a game.
     if (typeof module === 'object' && module.exports) {
-        module.exports = { DEFAULTS, AUTOMATIC_RULES, DIFFICULTY, PARTY_DIFFICULTY, LANTERN_STAGE, CHEST_SLOTS, CHEST_CATEGORY_ORDER, QUALITY_NAMES, PANEL_DEFAULTS, panelLayout, normalizeSettings, snapshotSettings, normalizeModeStore, readPartyState, partyDialogKind, isLanternStage, departureDialogKind, townNpcMatches, parseSkillRules, normalizeSkillProfile, mergeSkillProfile,
-            moveSkill, readTalentSkills, talentSkillSources, readSkillTransforms, buildSkillCatalog, cardQuality, rerollIsLocked, highestQualityChoice, eliminationChoicesExhausted, exhaustedChoice, canTankDamage, canTankChest, valuablePickup, ordinaryPickup, openingFarmActive, meatHealing, routePickupContact, recoveryOpportunity, configuredSkillDecision, buildChestCatalog, chestCandidateRanks, configuredChestDecision,
+        module.exports = { DEFAULTS, AUTOMATIC_RULES, DIFFICULTY, PARTY_DIFFICULTY, LANTERN_STAGE, TOWER_STAGE, CHEST_SLOTS, CHEST_CATEGORY_ORDER, QUALITY_NAMES, PANEL_DEFAULTS, panelLayout, normalizeSettings, snapshotSettings, normalizeModeStore, readPartyState, partyDialogKind, isLanternStage, isTowerStage, towerNpcMatches, departureDialogKind, townNpcMatches, parseSkillRules, normalizeSkillProfile, mergeSkillProfile,
+            moveSkill, readTalentSkills, talentSkillSources, readSkillTransforms, buildSkillCatalog, cardQuality, rerollIsLocked, highestQualityChoice, eliminationChoicesExhausted, exhaustedChoice, canTankDamage, canTankChest, valuablePickup, ordinaryPickup, openingFarmActive, meatHealing, routePickupContact, recoveryOpportunity, configuredSkillDecision, towerCardValue, towerCardDecision, buildChestCatalog, chestCandidateRanks, configuredChestDecision,
             skillProfileId, preferredIds, nativeCardActions, cardControlPlans, pendingNativeOffer, pickStage, parseImports,
             findRegistryBinding, resolveGameBindings, zoneContains, threatRisk, movingArrowRisk, friendlyAreaPoint, selectFriendlyArea,
             readBellShelters, selectBellShelter, bellDestination, bellRoute, navigationContext, terrainSpace, crowdPressure,
