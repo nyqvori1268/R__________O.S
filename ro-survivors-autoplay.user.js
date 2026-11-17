@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RO Survivors 自動遠征
 // @namespace    local.ro-survivors.autoplay
-// @version      2.1.12
+// @version      2.1.13
 // @author       nyqvori1268
 // @homepageURL  https://github.com/nyqvori1268/R__________O.S
 // @supportURL   https://github.com/nyqvori1268/R__________O.S/issues
@@ -28,7 +28,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '2.1.12';
+    const VERSION = '2.1.13';
     const SETTINGS_KEY = 'ro-autoplay.settings.v1';
     const MODE_SETTINGS_KEY = 'ro-autoplay.mode-settings.v1';
     const PANEL_DEFAULTS = { x: null, y: null, width: 620, height: 720, minimized: false };
@@ -37,7 +37,6 @@
         repeat: true,
         maxRuns: 0,
         repeatDelay: 4,
-        lanternSnakeOnly: false,
         skillPriority: '',
         skillProfiles: {},
         chestProfiles: {},
@@ -106,7 +105,6 @@
     // Keep a stable id so the choice survives list refreshes and language changes.
     const LANTERN_STAGE = { id: 'louyang', name: '燈籠節／洛陽（活動・固定難度）' };
     const TOWER_STAGE = { id: 'endless', name: '塔之守護者／無盡之塔（單次挑戰）' };
-    const LANTERN_SNAKE_ID = 'dark_snake_lord';
     const CHEST_SLOTS = [
         { id: 'potion', name: '藥水' },
         { id: 'elixir', name: '秘藥' },
@@ -131,32 +129,6 @@
     function isTowerStage(value) {
         return ['endless', TOWER_STAGE.name, '塔之守護者', '塔之守护者', '無盡之塔', '无尽之塔',
             '無限塔', '魔物終結塔', 'endless tower', 'tower guardian'].some(name => normalized(value) === normalized(name));
-    }
-
-    function lanternSnakeStatus(game) {
-        if (!game || game.stageId !== LANTERN_STAGE.id || game.endless) return 'unavailable';
-        const script = game.script;
-        if (script?.rare?.id !== LANTERN_SNAKE_ID || !Array.isArray(script.bosses)
-            || !script.bosses.every(boss => typeof boss?.id === 'string')) return 'pending';
-        if (game.rareId === LANTERN_SNAKE_ID || script.bosses.some(boss => boss.id === LANTERN_SNAKE_ID)) return 'present';
-        // Registry.start runs inside the constructor, BEFORE the entry response
-        // adds a rare boss. jobLabel/look are assigned later by the native entry
-        // flow. A constructor's default rareId=null is not yet a negative result.
-        if (game.rareId === null && typeof game.jobLabel === 'string' && game.jobLabel.trim()
-            && game.look?.look && typeof game.look.look === 'object') return 'absent';
-        return 'pending';
-    }
-
-    function nativeEndRunButton(root) {
-        const button = root?.getElementById?.('btn-endrun');
-        if (!button?.isConnected || button.disabled || typeof button.onclick !== 'function') return null;
-        // The native shared end-run handler settles/abandons the run. The usual
-        // quit handler SAVES it, which would resume the same no-snake run forever.
-        // This button is hidden outside the tower, but its registered callback
-        // is also the ordinary native forfeit path. Never substitute a save,
-        // fabricate a death, change rare flags, or call settlement endpoints.
-        const body = Function.prototype.toString.call(button.onclick).replace(/\s+/g, '');
-        return /^\(\)=>\{[\w$]+\((["'])pause\1\)[,;][\w$]+\((?:!1|false),(?:!0|true)\);?\}$/.test(body) ? button : null;
     }
 
     function towerNpcMatches(text, prompt = false) {
@@ -202,9 +174,6 @@
         result.stage = typeof result.stage === 'string' ? result.stage : 'first';
         if (isLanternStage(result.stage)) result.stage = LANTERN_STAGE.id;
         if (isTowerStage(result.stage)) result.stage = TOWER_STAGE.id;
-        // This destructive-to-the-current-run option requires an actual JSON
-        // boolean opt-in. Legacy settings and truthy strings stay disabled.
-        result.lanternSnakeOnly = input.lanternSnakeOnly === true;
         result.skillPriority = typeof result.skillPriority === 'string' ? result.skillPriority : '';
         result.skillProfiles = {};
         for (const [job, profile] of Object.entries(input.skillProfiles ?? {})) {
@@ -1624,8 +1593,6 @@
             this.game = null;
             this.seenGames = new WeakSet();
             this.finishedGames = new WeakSet();
-            this.lanternSkippedGames = new WeakSet();
-            this.lanternSkipCount = 0;
             this.zones = [];
             this.arrows = [];
             this.groundWeapons = new WeakSet();
@@ -2366,7 +2333,6 @@
             this.syncPartyMode();
             this.runCount = 0;
             this.retryCount = 0;
-            this.lanternSkipCount = 0;
             this.clearRiskMotion();
             this.enabled = true;
             this.restartAt = 0;
@@ -2435,7 +2401,6 @@
                 return;
             }
             if (this.visible('#picker')) { this.cancelMovement(); this.handlePicker(now); return; }
-            if (this.handleLanternSnakeHunt(now)) return;
             if (isTowerStage(this.settings.stage) && this.visible('#lobby-ui')
                 && (this.activeMode === 'party' || this.partyState?.inParty)) {
                 this.stop('無盡之塔為單人挑戰，請手動離隊並確認技能／強化後再按 F8'); return;
@@ -2794,45 +2759,6 @@
             this.click(take, 800);
         }
 
-        lanternHuntActive(game = this.game) {
-            return this.settings.lanternSnakeOnly === true && isLanternStage(this.settings.stage)
-                && game?.stageId === LANTERN_STAGE.id && !game.endless;
-        }
-
-        handleLanternSnakeHunt(now) {
-            const game = this.game;
-            if (!this.lanternHuntActive(game) || this.visible('#lobby-ui') || game.state !== 'playing'
-                || game.player?.dead || this.visible('#npc-dialog')) return false;
-            if (lanternSnakeStatus(game) !== 'absent') return false;
-            const coop = game.coop;
-            const host = coop ? coop.isHost === true || Number(coop.me) > 0 && Number(coop.host) > 0 && coop.me === coop.host
-                : !this.isPartyRun();
-            // A replica must never terminate only its own character or decide
-            // for the host. Followers continue normal play until the host exits.
-            if (!host) return false;
-            if (this.lanternSkippedGames.has(game)) return true;
-            if (now - this.lastAction < 850) { this.status = '本局沒有墨蛇，準備重新尋找'; return true; }
-            const end = nativeEndRunButton(document);
-            if (!end) { this.stop('無法辨識原生結束本局介面；只刷墨蛇已停止，請手動結束本局'); return true; }
-            this.cancelMovement();
-            this.lanternSkippedGames.add(game);
-            this.lastAction = now;
-            this.status = '本局沒有墨蛇，結束本局並等待伺服器結算';
-            // Deliberately use the validated native end-run callback, including
-            // its host-leave notification and normal server settlement.
-            try { end.click(); }
-            catch {
-                if (game.state !== 'over') this.lanternSkippedGames.delete(game);
-                this.stop('原生結束本局發生錯誤，請手動處理；搜尋已停止');
-                return true;
-            }
-            if (game.state !== 'over' && !this.visible('#gameover') && !this.visible('#lobby-ui')) {
-                this.lanternSkippedGames.delete(game);
-                this.stop('原生結束本局未生效，請手動處理；不會重複送出結束操作');
-            } else this.log('燈籠節：本局未排定墨蛇，已使用原生流程結束；空場不計完成場數');
-            return true;
-        }
-
         handlePicker(now) {
             if (this.game?.endless) { this.handleTowerPicker(now); return; }
             const picker = document.getElementById('picker');
@@ -2857,7 +2783,7 @@
                 if (!profile && !(this.settings.fallbackLockedReroll && rerollIsLocked(this.game))) { this.status = '等待讀取職業技能'; return; }
                 let decision = profile ? configuredSkillDecision(this.offer.cards, profile, this.settings,
                     this.game.time, this.game.perksLeft?.reroll || 0, this.game.basicAttack) : { action: 'wait' };
-                if ((this.isPartyRun() || this.lanternHuntActive()) && decision.action === 'restart') decision = { action: 'wait' };
+                if (this.isPartyRun() && decision.action === 'restart') decision = { action: 'wait' };
                 if (this.tryCardControls('skill', profile, decision)) return;
                 decision = this.withLockedRerollFallback(decision, 'skill');
                 decision = this.withExhaustedChoiceFallback(decision, 'skill', profile);
@@ -2986,7 +2912,6 @@
         }
 
         restartForSkillBuild() {
-            if (this.lanternHuntActive()) { this.status = '只刷墨蛇時不因技能配置重開，保留本局墨蛇機會'; return; }
             if (this.game?.endless) { this.status = '無盡之塔為單次挑戰，不因技能配置重開'; return; }
             if (this.isPartyRun()) { this.status = '組隊中停用個人開場重開，依備援選牌設定處理'; return; }
             const game = this.game;
@@ -3118,15 +3043,7 @@
             // repeat is off. Never leave an unfinished Need/Greed vote early.
             if (this.handleServerSettlement()) return;
             const game = this.game;
-            const skillRetry = Boolean(game && this.retryGame === game);
-            // A follower can recognize a host-initiated empty-run exit without
-            // ever issuing a forfeit itself. Its own opt-in still controls retry.
-            if (this.lanternHuntActive(game) && game.coop?.leaderLeft && lanternSnakeStatus(game) === 'absent') {
-                this.lanternSkippedGames.add(game);
-            }
-            const skipped = Boolean(game && this.lanternSkippedGames.has(game));
-            const snakeRetry = skipped && this.lanternHuntActive(game);
-            const retry = skillRetry || snakeRetry;
+            const retry = Boolean(game && this.retryGame === game);
             if (game && !this.finishedGames.has(game)) {
                 this.finishedGames.add(game);
                 this.clearPickupGoal();
@@ -3134,18 +3051,17 @@
                 this.clearRiskMotion();
                 this.bellMode = null;
                 this.blockedPickups = new WeakMap();
-                if (skipped) { this.lanternSkipCount++; this.log(`已略過 ${this.lanternSkipCount} 個無墨蛇空場；已完成 ${this.runCount} 場`); }
-                else if (skillRetry) { this.retryCount += 1; this.log(`技能配置重新出征，第 ${this.retryCount} 次`); }
+                if (retry) { this.retryCount += 1; this.log(`技能配置重新出征，第 ${this.retryCount} 次`); }
                 else { this.runCount += 1; this.log(`第 ${this.runCount} 場結束`); }
             }
             const finished = !retry && (!this.settings.repeat || this.settings.maxRuns > 0 && this.runCount >= this.settings.maxRuns);
             const party = this.isPartyRun();
             if (finished && !party) {
-                this.stop(skipped ? '已關閉只刷墨蛇，本次空場已結束' : `已完成 ${this.runCount} 場`);
+                this.stop(`已完成 ${this.runCount} 場`);
                 return;
             }
-            if (!this.restartAt) this.restartAt = now + (skillRetry ? 500 : this.settings.repeatDelay * 1000);
-            this.status = `${Math.max(0, Math.ceil((this.restartAt - now) / 1000))} 秒後${snakeRetry ? '返回大廳繼續尋找墨蛇' : party ? '返回大廳' : '再次出征'}`;
+            if (!this.restartAt) this.restartAt = now + (retry ? 500 : this.settings.repeatDelay * 1000);
+            this.status = `${Math.max(0, Math.ceil((this.restartAt - now) / 1000))} 秒後${party ? '返回大廳' : '再次出征'}`;
             if (now < this.restartAt) return;
             if (this.click(document.getElementById('btn-restart'))) {
                 this.restartAt = 0;
@@ -3653,11 +3569,6 @@
                             <section class="tab-panel" id="ra-page-stage" role="tabpanel" aria-labelledby="ra-tab-stage" tabindex="0">
                                 <h2>出征&amp;難度</h2>
                                 <div class="row"><label for="ra-stage">副本</label><select id="ra-stage"><option value="first">第一個可挑戰副本</option><option value="last">最後一個可挑戰副本</option><option value="${LANTERN_STAGE.id}">${LANTERN_STAGE.name}</option><option value="${TOWER_STAGE.id}">${TOWER_STAGE.name}</option></select></div>
-                                <div id="ra-lantern-options" hidden>
-                                    <label><input type="checkbox" data-setting="lanternSnakeOnly"> 只刷隱藏 BOSS（墨蛇）</label>
-                                    <div class="hint">選用功能，預設關閉。確認本局沒有墨蛇才結束並重新入場，直到遇到為止；有墨蛇的場次結束後依重複／場數設定處理。空場不計完成場數，F8 可隨時停止。組隊需由隊長啟用。</div>
-                                    <div class="hint" id="ra-lantern-state">等待入場資料確認</div>
-                                </div>
                                 <div class="row" id="ra-repeat-controls"><label><input type="checkbox" data-setting="repeat"> 重複出征</label><label for="ra-runs">場數</label><input id="ra-runs" type="number" data-setting="maxRuns" min="0" max="9999"></div>
                                 <div class="hint" id="ra-repeat-hint">場數 0 持續出征。F8 開啟時重新計數；一般副本與隊長交談後載入，燈籠節由節慶主持人進場。</div>
                                 <div class="hint" id="ra-party-state"></div>
@@ -3772,10 +3683,6 @@
             if (!this.ui) return;
             const festival = isLanternStage(this.settings.stage);
             const tower = isTowerStage(this.settings.stage) || Boolean(this.game?.endless && !this.visible('#lobby-ui'));
-            this.ui.querySelector('#ra-lantern-options').hidden = !festival || tower;
-            const snake = this.game && !this.visible('#lobby-ui') ? lanternSnakeStatus(this.game) : 'pending';
-            const snakeLabel = { present: '本局有墨蛇', absent: '本局沒有墨蛇', pending: '等待入場資料確認', unavailable: '等待燈籠節副本' }[snake];
-            this.ui.querySelector('#ra-lantern-state').textContent = `${snakeLabel} · ${this.settings.lanternSnakeOnly ? `只刷已啟用 · 已略過 ${this.lanternSkipCount} 個空場` : '只刷未啟用'}`;
             const controls = this.ui.querySelector('#ra-difficulty-controls');
             if (controls) controls.hidden = festival || tower;
             for (const input of this.ui.querySelectorAll('[data-difficulty]')) input.disabled = festival || tower;
@@ -3827,7 +3734,7 @@
 
     // The exports allow the decision and controller logic to be tested without starting a game.
     if (typeof module === 'object' && module.exports) {
-        module.exports = { DEFAULTS, AUTOMATIC_RULES, DIFFICULTY, PARTY_DIFFICULTY, LANTERN_STAGE, TOWER_STAGE, LANTERN_SNAKE_ID, lanternSnakeStatus, nativeEndRunButton, CHEST_SLOTS, CHEST_CATEGORY_ORDER, QUALITY_NAMES, PANEL_DEFAULTS, panelLayout, normalizeSettings, snapshotSettings, normalizeModeStore, readPartyState, partyDialogKind, isLanternStage, isTowerStage, towerNpcMatches, departureDialogKind, townNpcMatches, parseSkillRules, normalizeSkillProfile, mergeSkillProfile,
+        module.exports = { DEFAULTS, AUTOMATIC_RULES, DIFFICULTY, PARTY_DIFFICULTY, LANTERN_STAGE, TOWER_STAGE, CHEST_SLOTS, CHEST_CATEGORY_ORDER, QUALITY_NAMES, PANEL_DEFAULTS, panelLayout, normalizeSettings, snapshotSettings, normalizeModeStore, readPartyState, partyDialogKind, isLanternStage, isTowerStage, towerNpcMatches, departureDialogKind, townNpcMatches, parseSkillRules, normalizeSkillProfile, mergeSkillProfile,
             moveSkill, readTalentSkills, talentSkillSources, readSkillTransforms, buildSkillCatalog, cardQuality, rerollIsLocked, highestQualityChoice, eliminationChoicesExhausted, exhaustedChoice, canTankDamage, canTankChest, valuablePickup, ordinaryPickup, openingFarmActive, meatHealing, routePickupContact, recoveryOpportunity, configuredSkillDecision, towerCardValue, towerCardDecision, buildChestCatalog, chestCandidateRanks, configuredChestDecision,
             skillProfileId, preferredIds, nativeCardActions, cardControlPlans, pendingNativeOffer, pickStage, parseImports,
             findRegistryBinding, resolveGameBindings, zoneContains, threatRisk, movingArrowRisk, friendlyAreaPoint, selectFriendlyArea,
