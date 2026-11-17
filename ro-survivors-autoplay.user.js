@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RO Survivors 自動遠征
 // @namespace    local.ro-survivors.autoplay
-// @version      2.1.9
+// @version      2.1.10
 // @author       nyqvori1268
 // @homepageURL  https://github.com/nyqvori1268/R__________O.S
 // @supportURL   https://github.com/nyqvori1268/R__________O.S/issues
@@ -27,7 +27,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '2.1.9';
+    const VERSION = '2.1.10';
     const SETTINGS_KEY = 'ro-autoplay.settings.v1';
     const MODE_SETTINGS_KEY = 'ro-autoplay.mode-settings.v1';
     const PANEL_DEFAULTS = { x: null, y: null, width: 620, height: 720, minimized: false };
@@ -2115,30 +2115,35 @@
         renderChestGroups() {
             if (!this.ui) return;
             const context = this.chestContext;
-            const label = this.ui.querySelector('#ra-chest-job');
-            if (!context) { label.textContent = '等待讀取目前角色職業'; return; }
-            label.textContent = `目前職業　${context.name}`;
-            const container = this.ui.querySelector('#ra-chest-groups');
+            for (const selector of ['#ra-chest-job', '#ra-deity-job']) {
+                this.ui.querySelector(selector).textContent = context ? `目前職業　${context.name}` : '等待讀取目前角色職業';
+            }
+            if (!context) return;
             this.keepPanelScroll(() => {
-                const groups = new Map(Array.from(container.children).map(group => [group.dataset.slot, group]));
-                for (const [index, slot] of CHEST_SLOTS.entries()) {
-                    let group = groups.get(slot.id);
-                    if (!group) {
-                        group = document.createElement('details');
-                        group.dataset.slot = slot.id;
-                        const summary = document.createElement('summary');
-                        summary.textContent = slot.name;
-                        const owned = document.createElement('div');
-                        owned.className = 'hint';
-                        owned.dataset.ownedSlot = slot.id;
-                        const list = document.createElement('div');
-                        list.className = 'skill-list';
-                        list.dataset.listSlot = slot.id;
-                        group.append(summary, owned, list);
+                for (const deity of [false, true]) {
+                    const container = this.ui.querySelector(deity ? '#ra-deity-groups' : '#ra-chest-groups');
+                    const groups = new Map(Array.from(container.children).map(group => [group.dataset.slot, group]));
+                    const slots = CHEST_SLOTS.filter(slot => (slot.id === 'deity') === deity);
+                    for (const [index, slot] of slots.entries()) {
+                        let group = groups.get(slot.id);
+                        if (!group) {
+                            group = document.createElement('details');
+                            group.dataset.slot = slot.id;
+                            if (deity) group.setAttribute('open', '');
+                            const summary = document.createElement('summary');
+                            summary.textContent = slot.name;
+                            const owned = document.createElement('div');
+                            owned.className = 'hint';
+                            owned.dataset.ownedSlot = slot.id;
+                            const list = document.createElement('div');
+                            list.className = 'skill-list';
+                            list.dataset.listSlot = slot.id;
+                            group.append(summary, owned, list);
+                        }
+                        this.placeRow(container, group, index);
+                        const list = group.querySelector('.skill-list');
+                        this.renderPriorityList(list, context.groups[slot.id], () => this.settings.chestProfiles[context.key][slot.id], () => this.renderChestGroups());
                     }
-                    this.placeRow(container, group, index);
-                    const list = group.querySelector('.skill-list');
-                    this.renderPriorityList(list, context.groups[slot.id], () => this.settings.chestProfiles[context.key][slot.id], () => this.renderChestGroups());
                 }
             });
             this.updateChestOwned();
@@ -3201,6 +3206,41 @@
             this.applyPanelLayout();
         }
 
+        selectPanelTab(id, focus = false) {
+            if (!this.ui) return;
+            const buttons = Array.from(this.ui.querySelectorAll('[role="tab"]'));
+            const selected = buttons.find(button => button.dataset.tab === id);
+            if (!selected) return;
+            for (const button of buttons) {
+                const active = button === selected;
+                button.setAttribute('aria-selected', String(active));
+                button.tabIndex = active ? 0 : -1;
+                this.ui.querySelector(`#${button.getAttribute('aria-controls')}`).hidden = !active;
+            }
+            if (focus) {
+                selected.focus({ preventScroll: true });
+                selected.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+            }
+        }
+
+        bindPanelTabs() {
+            const buttons = Array.from(this.ui.querySelectorAll('[role="tab"]'));
+            for (const [index, button] of buttons.entries()) {
+                button.onclick = () => this.selectPanelTab(button.dataset.tab);
+                button.addEventListener('keydown', event => {
+                    let next;
+                    if (event.key === 'ArrowRight') next = (index + 1) % buttons.length;
+                    else if (event.key === 'ArrowLeft') next = (index + buttons.length - 1) % buttons.length;
+                    else if (event.key === 'Home') next = 0;
+                    else if (event.key === 'End') next = buttons.length - 1;
+                    else return;
+                    event.preventDefault();
+                    this.selectPanelTab(buttons[next].dataset.tab, true);
+                });
+            }
+            this.selectPanelTab('stage');
+        }
+
         buildPanel() {
             this.host = document.createElement('div');
             this.host.id = 'ro-auto-panel';
@@ -3223,8 +3263,9 @@
                     .status{color:#82dabb;white-space:pre-wrap;margin:8px 0}.log{white-space:pre-wrap;font-size:16px;color:#b2c1d0;max-height:140px;overflow:auto}
                     .shortcut{color:#9de4c7;background:#1c3f37;border:1px solid #416e60;border-radius:6px;padding:6px 10px}.shortcut.running{background:#624127;color:#ffe0b1}.hp-row{padding-top:10px;border-top:1px solid #34465a}
                     .hidden{display:none}.stat{color:#aabccf;font-size:16px}
-                    .workspace{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;margin-top:16px;align-items:start}.workspace>details{min-width:0;margin:0;border:1px solid #344b61;border-radius:8px;padding:12px;background:#101c2a80}.workspace>details>summary{font-size:17px;color:#c5dcf7}.choice-settings>summary{font-size:16px;color:#afc8e7}
-                    @container (min-width:920px){.workspace{grid-template-columns:repeat(2,minmax(0,1fr))}.wide-span{grid-column:1/-1}}
+                    .workspace{min-width:0;margin-top:16px}.tabs{position:sticky;top:0;z-index:1;display:flex;gap:6px;overflow-x:auto;overscroll-behavior-x:contain;padding:4px 0 10px;scrollbar-width:thin;background:#13202f}
+                    .tabs button{flex:none;white-space:nowrap;font-size:16px;font-weight:600;padding:7px 10px}.tabs button[aria-selected=true]{background:#365b83;border-color:#99c3ff;color:#fff}.tabs button:focus-visible{outline:2px solid #b3d1ff;outline-offset:2px}
+                    .tab-panel{min-width:0;border:1px solid #344b61;border-radius:8px;padding:12px;background:#101c2a80}.tab-panel h2{font-size:17px;color:#c5dcf7;margin:0 0 8px}
                     [hidden]{display:none!important}
                     .difficulty-row{flex-wrap:nowrap}.difficulty-row label{flex:0 0 94px;min-width:0}.difficulty-row small{display:block;font-size:16px}
                     input[type=range]{flex:1;width:100px;min-width:50px;accent-color:#8bb6ff;margin:0}.difficulty-row output{min-width:40px;text-align:right;color:#a9caff;font-weight:600}
@@ -3243,7 +3284,15 @@
                         <div class="row hp-row"><label for="ra-hp">承傷拾取最低 HP</label><input id="ra-hp" type="number" data-setting="tankHpPercent" min="0" max="100" step="1"><span>%</span></div>
                         <div class="hint">HP 達門檻且有沿途補血或可用回血技能時，可承傷湊錢／開箱。自動避開死路；裝備與卡片留待結算。</div>
                         <div class="workspace">
-                            <details class="wide-span"><summary>出征與難度</summary>
+                            <div class="tabs" role="tablist" aria-label="自動遠征設定">
+                                <button type="button" id="ra-tab-stage" role="tab" data-tab="stage" aria-controls="ra-page-stage" aria-selected="true">出征&amp;難度</button>
+                                <button type="button" id="ra-tab-skills" role="tab" data-tab="skills" aria-controls="ra-page-skills" aria-selected="false" tabindex="-1">技能配置</button>
+                                <button type="button" id="ra-tab-items" role="tab" data-tab="items" aria-controls="ra-page-items" aria-selected="false" tabindex="-1">本局道具</button>
+                                <button type="button" id="ra-tab-deity" role="tab" data-tab="deity" aria-controls="ra-page-deity" aria-selected="false" tabindex="-1">神祇</button>
+                                <button type="button" id="ra-tab-backup" role="tab" data-tab="backup" aria-controls="ra-page-backup" aria-selected="false" tabindex="-1">備份與紀錄</button>
+                            </div>
+                            <section class="tab-panel" id="ra-page-stage" role="tabpanel" aria-labelledby="ra-tab-stage" tabindex="0">
+                                <h2>出征&amp;難度</h2>
                                 <div class="row"><label for="ra-stage">副本</label><select id="ra-stage"><option value="first">第一個可挑戰副本</option><option value="last">最後一個可挑戰副本</option><option value="${LANTERN_STAGE.id}">${LANTERN_STAGE.name}</option></select></div>
                                 <div class="row"><label><input type="checkbox" data-setting="repeat"> 重複出征</label><label for="ra-runs">場數</label><input id="ra-runs" type="number" data-setting="maxRuns" min="0" max="9999"></div>
                                 <div class="hint">場數 0 持續出征。F8 開啟時重新計數；一般副本與隊長交談後載入，燈籠節由節慶主持人進場。</div>
@@ -3252,23 +3301,33 @@
                                 ${DIFFICULTY.map(item => `<div class="row difficulty-row"><label for="ra-diff-${item.key}">${item.name}<small data-difficulty-range="${item.key}">100–${Math.round(item.max * 100)}%</small></label><input type="range" id="ra-diff-${item.key}" data-difficulty="${item.key}" min="1" max="${item.max}" step="0.05"><output for="ra-diff-${item.key}" data-difficulty-out="${item.key}">100%</output></div>`).join('')}
                                 </div>
                                 <div class="hint" id="ra-stage-hint"></div>
-                            </details>
-                            <details open class="skills-card"><summary>技能配置</summary>
+                            </section>
+                            <section class="tab-panel" id="ra-page-skills" role="tabpanel" aria-labelledby="ra-tab-skills" tabindex="0" hidden>
+                                <h2>技能配置</h2>
                                 <div class="job-label" id="ra-job">等待讀取目前角色職業</div>
                                 <div class="hint" id="ra-talents" title="游標移入可查看已讀取的天賦">等待讀取角色天賦</div>
                                 <div class="hint">天賦與裝備變更時自動同步。↑ ↓ 排序；❌ 排除並置底，暫時消失的技能保留設定。</div>
                                 <div id="ra-skill-list" class="skill-list"></div>
-                            </details>
-                            <details open class="chest-card"><summary>本局道具與神祇</summary>
+                            </section>
+                            <section class="tab-panel" id="ra-page-items" role="tabpanel" aria-labelledby="ra-tab-items" tabindex="0" hidden>
+                                <h2>本局道具</h2>
                                 <div class="job-label" id="ra-chest-job">等待讀取目前角色職業</div>
-                                <div class="hint">↑ ↓ 排序；❌ 排除並置底。每類限 1 種，屬性／技能神祇共用 1 欄。</div>
+                                <div class="hint">↑ ↓ 排序；❌ 排除並置底。藥水、秘藥、祝福與料理每類限 1 種。</div>
                                 <div class="hint">依官方本局條件更新，游標可看效果範圍。先補齊：神祇 → 祝福 → 秘藥 → 藥水 → 料理。</div>
                                 <div id="ra-chest-groups"></div>
-                            </details>
-                            <details class="wide-span"><summary>備份與紀錄</summary>
+                            </section>
+                            <section class="tab-panel" id="ra-page-deity" role="tabpanel" aria-labelledby="ra-tab-deity" tabindex="0" hidden>
+                                <h2>神祇</h2>
+                                <div class="job-label" id="ra-deity-job">等待讀取目前角色職業</div>
+                                <div class="hint">↑ ↓ 排序；❌ 排除並置底。屬性／技能神祇共用 1 欄。</div>
+                                <div class="hint">技能神祇隨角色技能同步；實際可抽選項依本局條件，替換沿用原生限制。</div>
+                                <div id="ra-deity-groups"></div>
+                            </section>
+                            <section class="tab-panel" id="ra-page-backup" role="tabpanel" aria-labelledby="ra-tab-backup" tabindex="0" hidden>
+                                <h2>備份與紀錄</h2>
                                 <div class="row"><button id="ra-export">匯出設定</button><button id="ra-import">匯入設定</button><button id="ra-reconnect">重新連接</button><input type="file" id="ra-file" accept="application/json,.json" hidden></div>
                                 <div id="ra-log" class="log"></div>
-                            </details>
+                            </section>
                         </div>
                     </div>
                     <button id="ra-resize" class="resize-handle" title="拖曳調整大小；方向鍵微調" aria-label="調整面板大小（方向鍵）">↘</button>
@@ -3278,6 +3337,7 @@
             this.ui.addEventListener('pointerdown', event => event.stopPropagation());
             this.ui.querySelector('#ra-reconnect').onclick = () => this.connect();
             this.bindPanelControls();
+            this.bindPanelTabs();
             this.ui.querySelector('#ra-stage').onchange = event => {
                 this.settings.stage = event.target.value;
                 this.saveSettings();
